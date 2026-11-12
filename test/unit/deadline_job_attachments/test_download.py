@@ -3361,3 +3361,10 @@ def test_set_fs_permission_prefixes_both_files_and_directories(tmp_path: Path):
         shutil.rmtree(
             WINDOWS_UNC_PATH_STRING_PREFIX + str(first_long_component), ignore_errors=True
         )
+
+
+def test_get_num_download_workers_default():
+    """Small-file downloads use 20 threads with the default 50-connection pool, up from 5."""
+    from deadline.job_attachments.download import _get_num_download_workers
+
+    assert _get_num_download_workers() == 20
