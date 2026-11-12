@@ -21,6 +21,9 @@ class HashAlgorithm(str, Enum):
     XXH128 = "xxh128"
 
 
+_HASH_READ_SIZE = 1024 * 1024
+
+
 def hash_file(file_path: str, hash_alg: HashAlgorithm) -> str:
     """Hashes the given file using the given hashing algorithm."""
     if hash_alg == HashAlgorithm.XXH128:
@@ -32,12 +35,16 @@ def hash_file(file_path: str, hash_alg: HashAlgorithm) -> str:
             f"Unsupported hashing algorithm provided: {hash_alg}"
         )
 
-    with open(file_path, "rb") as file:
+    # Read in large chunks into a reused buffer. With small reads, the per-call overhead and
+    # GIL contention between hashing threads limited hashing to well below disk speed.
+    buffer = bytearray(_HASH_READ_SIZE)
+    view = memoryview(buffer)
+    with io.FileIO(file_path, "rb") as file:
         while True:
-            chunk = file.read(io.DEFAULT_BUFFER_SIZE)
-            if not chunk:
+            count = file.readinto(buffer)
+            if not count:
                 break
-            hasher.update(chunk)
+            hasher.update(view[:count])
         return hasher.hexdigest()
 
 
