@@ -77,6 +77,7 @@ from .progress_tracker import (
 from . import _utils
 from ._utils import (
     _get_long_path_compatible_path,
+    _get_num_transfer_workers,
     _is_relative_to,
     _join_s3_paths,
 )
@@ -155,12 +156,10 @@ class S3AssetUploader:
 
         self.small_file_threshold = S3_MULTIPART_UPLOAD_CHUNK_SIZE * small_file_threshold_multiplier
 
-        self.num_upload_workers = int(
-            s3_max_pool_connections
-            / min(small_file_threshold_multiplier, S3_UPLOAD_MAX_CONCURRENCY)
+        self.num_upload_workers = _get_num_transfer_workers(
+            s3_max_pool_connections,
+            min(small_file_threshold_multiplier, S3_UPLOAD_MAX_CONCURRENCY),
         )
-        if self.num_upload_workers <= 0:
-            self.num_upload_workers = 1
 
         self._s3 = get_s3_client(self._session, s3_max_pool_connections=s3_max_pool_connections)
 
