@@ -64,10 +64,14 @@ class S3CheckCache(CacheDB):
         be the thread local connection returned by get_local_connection()
         """
 
-        entry_vals = connection.execute(
-            f"SELECT * FROM {self.table_name} WHERE s3_key=?",
-            [s3_key],
-        ).fetchone()
+        pending = self._pending_entry(s3_key)
+        if pending is not None:
+            entry_vals = (pending["s3_key"], pending["last_seen_time"])
+        else:
+            entry_vals = connection.execute(
+                f"SELECT * FROM {self.table_name} WHERE s3_key=?",
+                [s3_key],
+            ).fetchone()
         if entry_vals:
             entry = S3CheckCacheEntry(
                 s3_key=entry_vals[0],
@@ -93,10 +97,13 @@ class S3CheckCache(CacheDB):
             return self.get_connection_entry(s3_key, self.db_connection)
 
     def put_entry(self, entry: S3CheckCacheEntry) -> None:
-        """Inserts or replaces an entry into the cache database."""
+        """
+        Inserts or replaces an entry into the cache database.
+
+        Writes are buffered and committed in batches; see CacheDB._flush().
+        """
         if self.enabled:
-            with self.db_lock, self.db_connection:
-                self.db_connection.execute(
-                    f"INSERT OR REPLACE INTO {self.table_name} VALUES(:s3_key, :last_seen_time)",
-                    entry.to_dict(),
-                )
+            self._queue_write(entry.s3_key, entry.to_dict())
+
+    def _insert_sql(self) -> str:
+        return f"INSERT OR REPLACE INTO {self.table_name} VALUES(:s3_key, :last_seen_time)"

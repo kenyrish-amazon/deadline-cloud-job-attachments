@@ -139,6 +139,17 @@ class HashCache(CacheDB):
 
         encoded_path = file_path_key.encode(encoding="utf-8", errors="surrogatepass")
 
+        pending = self._pending_entry((encoded_path, hash_algorithm.value, range_start, range_end))
+        if pending is not None:
+            return HashCacheEntry(
+                file_path=file_path_key,
+                hash_algorithm=hash_algorithm,
+                file_hash=pending["file_hash"],
+                last_modified_time=str(pending["last_modified_time"]),
+                range_start=range_start,
+                range_end=range_end,
+            )
+
         entry_vals = connection.execute(
             f"SELECT * FROM {self.table_name} "
             "WHERE file_path=? AND hash_algorithm=? AND range_start=? AND range_end=?",
@@ -190,21 +201,26 @@ class HashCache(CacheDB):
 
         The entry's range_start and range_end determine whether this is a whole-file
         hash (range_start=0, range_end=-1) or a byte-range hash.
+
+        Writes are buffered and committed in batches; see CacheDB._flush().
         """
         if self.enabled:
-            with self.db_lock, self.db_connection:
-                encoded_path = entry.file_path.encode(encoding="utf-8", errors="surrogatepass")
+            encoded_path = entry.file_path.encode(encoding="utf-8", errors="surrogatepass")
+            self._queue_write(
+                (encoded_path, entry.hash_algorithm.value, entry.range_start, entry.range_end),
+                {
+                    "file_path": encoded_path,
+                    "hash_algorithm": entry.hash_algorithm.value,
+                    "range_start": entry.range_start,
+                    "range_end": entry.range_end,
+                    "file_hash": entry.file_hash,
+                    "last_modified_time": entry.last_modified_time,
+                },
+            )
 
-                self.db_connection.execute(
-                    f"INSERT OR REPLACE INTO {self.table_name} "
-                    "VALUES(:file_path, :hash_algorithm, :range_start, :range_end, "
-                    ":file_hash, :last_modified_time)",
-                    {
-                        "file_path": encoded_path,
-                        "hash_algorithm": entry.hash_algorithm.value,
-                        "range_start": entry.range_start,
-                        "range_end": entry.range_end,
-                        "file_hash": entry.file_hash,
-                        "last_modified_time": entry.last_modified_time,
-                    },
-                )
+    def _insert_sql(self) -> str:
+        return (
+            f"INSERT OR REPLACE INTO {self.table_name} "
+            "VALUES(:file_path, :hash_algorithm, :range_start, :range_end, "
+            ":file_hash, :last_modified_time)"
+        )

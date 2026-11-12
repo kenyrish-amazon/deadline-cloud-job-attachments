@@ -31,6 +31,10 @@ class CacheDB(ABC):
     # Number of retry attempts for SQLite operational errors (e.g., database locks)
     _RETRY_ATTEMPTS = 3
 
+    # Writes are buffered and committed together. A commit per entry costs an fsync, which
+    # dominated hashing time for many small files on Linux (about 1.5 ms per commit on EBS).
+    _WRITE_BATCH_SIZE = 500
+
     def __init__(
         self, cache_name: str, table_name: str, create_query: str, cache_dir: Optional[str] = None
     ) -> None:
@@ -41,6 +45,7 @@ class CacheDB(ABC):
         self.create_query: str = create_query
         self._local = _threading.local()
         self._local_connections: set = set()
+        self._pending_writes: dict = {}
 
         try:
             # SQLite is included in Python installers, but might not exist if building python from source.
@@ -108,6 +113,13 @@ class CacheDB(ABC):
         if self.enabled:
             import sqlite3
 
+            try:
+                self._flush()
+            except sqlite3.Error as e:
+                # The cache is an optimization; losing unflushed entries only costs a re-hash or
+                # an extra S3 check later, so don't fail the caller's operation over it.
+                logger.warning(f"Failed to write {self.cache_name} entries with error {e}")
+                self._pending_writes.clear()
             self.db_connection.close()
             for conn in self._local_connections:
                 try:
@@ -116,6 +128,39 @@ class CacheDB(ABC):
                     logger.warning(f"SQLite connection failed to close with error {e}")
 
             self._local_connections.clear()
+
+    def _insert_sql(self) -> str:
+        """The parameterized INSERT OR REPLACE statement used to write one entry."""
+        raise NotImplementedError
+
+    def _queue_write(self, key: object, params: dict) -> None:
+        """Buffers an entry, committing the buffer once it reaches _WRITE_BATCH_SIZE entries."""
+        with self.db_lock:
+            self._pending_writes[key] = params
+            if len(self._pending_writes) >= self._WRITE_BATCH_SIZE:
+                self._flush_locked()
+
+    def _pending_entry(self, key: object) -> Optional[dict]:
+        """
+        Returns a buffered entry that hasn't been committed yet, so reads see every put_entry.
+
+        Doesn't take db_lock: get_entry already holds it and the lock isn't reentrant. A single
+        dict lookup is atomic.
+        """
+        return self._pending_writes.get(key)
+
+    def _flush_locked(self) -> None:
+        if not self._pending_writes:
+            return
+        with self.db_connection:
+            self.db_connection.executemany(self._insert_sql(), list(self._pending_writes.values()))
+        self._pending_writes.clear()
+
+    def _flush(self) -> None:
+        """Commits buffered entries to the database. Called automatically on context exit."""
+        if self.enabled:
+            with self.db_lock:
+                self._flush_locked()
 
     def get_local_connection(self):
         """Create and/or returns a thread local connection to the SQLite database."""
@@ -171,6 +216,7 @@ class CacheDB(ABC):
         if self.enabled:
             import sqlite3
 
+            self._pending_writes.clear()
             self.db_connection.close()
             conn_list = list(self._local_connections)
             for conn in conn_list:
