@@ -4,7 +4,7 @@ import concurrent.futures
 import logging
 import os
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from math import trunc
 from deadline.job_attachments._utils import _get_long_path_compatible_path
 from deadline.job_attachments.exceptions import NonValidInputError
@@ -145,7 +145,7 @@ def _fast_file_list_to_manifest_diff(
         input_files_map[normalized_path] = input_file
 
     # Iterate for each file that we found in glob.
-    root_relative_paths: List[str] = []
+    root_relative_paths: Set[str] = set()
     for local_file in current_files:
         # Get the file's time stamp and size. We want to compare both.
         # From enabling CRT, sometimes timestamp update can fail.
@@ -157,9 +157,9 @@ def _fast_file_list_to_manifest_diff(
         file_stat = _get_long_path_compatible_path(local_file_path).stat()
 
         # Compare the glob against the relative path we store in the manifest.
-        # Save it to a list so we can look for deleted files.
+        # Save it so we can look for deleted files.
         root_relative_path = str(PurePosixPath(*local_file_path.relative_to(root).parts).as_posix())
-        root_relative_paths.append(root_relative_path)
+        root_relative_paths.add(root_relative_path)
 
         return_path = select_path(
             full_path=local_file,
