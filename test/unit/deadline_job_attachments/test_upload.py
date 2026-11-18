@@ -1276,7 +1276,7 @@ class TestUpload:
         Test that when the asset uploader is created, the instance variables are correctly set.
         """
         uploader = S3AssetUploader(s3_max_pool_connections=50, small_file_threshold_multiplier=20)
-        assert uploader.num_upload_workers == 5
+        assert uploader.num_upload_workers == 20
         assert uploader.small_file_threshold == 20 * 8 * (1024**2)
 
     def test_asset_uploader_constructor_with_non_integer_config_settings(

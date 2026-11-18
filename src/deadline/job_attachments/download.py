@@ -75,6 +75,7 @@ from .os_file_permission import (
 )
 from ._utils import (
     _get_long_path_compatible_path,
+    _get_num_transfer_workers,
     _is_relative_to,
 )
 from threading import Lock
@@ -987,13 +988,9 @@ def download_files_from_manifests(
 def _get_num_download_workers(s3_max_pool_connections: int = 50) -> int:
     """
     Determines the max number of thread workers for downloading multiple files in parallel,
-    based on the allowed S3 max pool connections size. If the max worker count is calculated
-    to be 0 due to a small pool connections size limit, it returns 1.
+    based on the allowed S3 max pool connections size. Returns at least 1.
     """
-    num_download_workers = int(s3_max_pool_connections / S3_DOWNLOAD_MAX_CONCURRENCY)
-    if num_download_workers <= 0:
-        num_download_workers = 1
-    return num_download_workers
+    return _get_num_transfer_workers(s3_max_pool_connections, S3_DOWNLOAD_MAX_CONCURRENCY)
 
 
 def _set_fs_group(

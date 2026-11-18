@@ -277,3 +277,25 @@ def _retry(
         return f_retry  # true decorator
 
     return deco_retry
+
+
+# Small files are transferred on this many threads by default. With the old sizing
+# (pool connections / per-file transfer concurrency) the default was 5, which left most of
+# the connection pool idle for jobs with many small files. Gains stopped at about 20 threads
+# on an 8 vCPU host, and more threads only cost CPU.
+_DEFAULT_SMALL_FILE_TRANSFER_WORKERS = 20
+
+
+def _get_num_transfer_workers(s3_max_pool_connections: int, transfer_concurrency: int) -> int:
+    """
+    Returns how many files to transfer in parallel for a given S3 connection pool size.
+
+    Leaves transfer_concurrency connections for the transfer manager's own requests, and never
+    returns fewer workers than the previous pool / transfer_concurrency sizing, so callers that
+    raised s3_max_pool_connections keep at least the parallelism they had.
+    """
+    previous = s3_max_pool_connections // transfer_concurrency
+    default = min(
+        _DEFAULT_SMALL_FILE_TRANSFER_WORKERS, s3_max_pool_connections - transfer_concurrency
+    )
+    return max(1, previous, default)
