@@ -16,6 +16,7 @@ from deadline.job_attachments._utils import (
     WINDOWS_UNC_PATH_STRING_PREFIX,
     _as_extended_length_path,
     _get_long_path_compatible_path,
+    _get_num_transfer_workers,
     _normalize_windows_path,
     _is_relative_to,
     _retry,
@@ -634,3 +635,18 @@ class TestGetLongPathCompatiblePathAgainstRealFilesystem:
             WINDOWS_UNC_DEVICE_PATH_STRING_PREFIX
         ), "A network path must take the \\\\?\\UNC\\ form"
         assert self._read_through(unc_path) == contents
+
+
+@pytest.mark.parametrize(
+    ("pool_connections", "transfer_concurrency", "expected"),
+    [
+        pytest.param(50, 10, 20, id="default pool"),
+        pytest.param(10, 10, 1, id="pool equal to transfer concurrency"),
+        pytest.param(5, 10, 1, id="pool smaller than transfer concurrency"),
+        pytest.param(25, 10, 15, id="leaves room for transfer manager requests"),
+        pytest.param(200, 10, 20, id="large pool keeps previous parallelism"),
+        pytest.param(500, 10, 50, id="very large pool keeps previous parallelism"),
+    ],
+)
+def test_get_num_transfer_workers(pool_connections, transfer_concurrency, expected):
+    assert _get_num_transfer_workers(pool_connections, transfer_concurrency) == expected

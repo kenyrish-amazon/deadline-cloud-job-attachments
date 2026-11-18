@@ -847,3 +847,198 @@ class TestS3CheckCache:
         locked_errors = {k: v for k, v in errors.items() if "database is locked" in v}
         assert len(locked_errors) == 0, f"Got database locked errors: {locked_errors}"
         assert len(errors) == 0, f"Got other errors: {errors}"
+
+
+def _hash_entry(i: int) -> HashCacheEntry:
+    return HashCacheEntry(
+        file_path=f"/batch/file_{i:05d}.txt",
+        hash_algorithm=HashAlgorithm.XXH128,
+        file_hash=f"hash_{i}",
+        last_modified_time=str(1700000000 + i),
+    )
+
+
+def _committed_rows(cache: CacheDB) -> int:
+    import sqlite3
+    from contextlib import closing
+
+    with closing(sqlite3.connect(cache.cache_dir)) as conn:
+        return conn.execute(f"SELECT COUNT(*) FROM {cache.table_name}").fetchone()[0]
+
+
+class TestBatchedWrites:
+    """
+    Tests for buffering cache writes and committing them in batches.
+    """
+
+    def test_unflushed_hash_entries_are_visible_to_reads(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        entry = _hash_entry(1)
+
+        with HashCache(cache_dir) as cache:
+            # WHEN
+            cache.put_entry(entry)
+
+            # THEN: readable through both read paths before anything is committed
+            assert _committed_rows(cache) == 0
+            assert cache.get_entry(entry.file_path, entry.hash_algorithm) == entry
+            assert (
+                cache.get_connection_entry(
+                    entry.file_path, entry.hash_algorithm, cache.get_local_connection()
+                )
+                == entry
+            )
+
+    def test_unflushed_s3_check_entries_are_visible_to_reads(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        entry = S3CheckCacheEntry(
+            s3_key="bucket/Data/hash.xxh128", last_seen_time=str(datetime.now().timestamp())
+        )
+
+        with S3CheckCache(cache_dir) as cache:
+            # WHEN
+            cache.put_entry(entry)
+
+            # THEN
+            assert _committed_rows(cache) == 0
+            assert cache.get_entry(entry.s3_key) == entry
+            assert cache.get_connection_entry(entry.s3_key, cache.get_local_connection()) == entry
+
+    def test_get_entry_with_pending_entry_does_not_deadlock(self, tmpdir):
+        """get_entry holds the non-reentrant db_lock while it reads pending entries."""
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        result = {}
+
+        with HashCache(cache_dir) as cache:
+            cache.put_entry(_hash_entry(1))
+
+            def read():
+                result["entry"] = cache.get_entry("/batch/file_00001.txt", HashAlgorithm.XXH128)
+
+            # WHEN
+            reader = threading.Thread(target=read, daemon=True)
+            reader.start()
+            reader.join(timeout=5)
+
+            # THEN
+            assert not reader.is_alive(), "get_entry deadlocked on db_lock"
+            assert result["entry"] == _hash_entry(1)
+
+    def test_entries_are_committed_on_exit(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        with HashCache(cache_dir) as cache:
+            for i in range(10):
+                cache.put_entry(_hash_entry(i))
+
+        # WHEN
+        with HashCache(cache_dir) as cache:
+            # THEN
+            assert _committed_rows(cache) == 10
+            assert cache.get_entry(_hash_entry(7).file_path, HashAlgorithm.XXH128) == _hash_entry(7)
+
+    def test_entries_are_committed_on_exit_after_an_exception(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+
+        # WHEN
+        with pytest.raises(RuntimeError):
+            with S3CheckCache(cache_dir) as cache:
+                cache.put_entry(S3CheckCacheEntry(s3_key="k", last_seen_time="1"))
+                raise RuntimeError("upload cancelled")
+
+        # THEN
+        with S3CheckCache(cache_dir) as cache:
+            assert _committed_rows(cache) == 1
+
+    def test_buffer_is_committed_when_it_reaches_the_batch_size(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        with patch.object(CacheDB, "_WRITE_BATCH_SIZE", 3):
+            with HashCache(cache_dir) as cache:
+                # WHEN
+                cache.put_entry(_hash_entry(1))
+                cache.put_entry(_hash_entry(2))
+                rows_before_batch = _committed_rows(cache)
+                cache.put_entry(_hash_entry(3))
+
+                # THEN
+                assert rows_before_batch == 0
+                assert _committed_rows(cache) == 3
+
+    def test_put_entry_twice_keeps_the_latest_value(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        first = _hash_entry(1)
+        second = HashCacheEntry(
+            file_path=first.file_path,
+            hash_algorithm=first.hash_algorithm,
+            file_hash="rehashed",
+            last_modified_time="1800000000",
+        )
+
+        # WHEN
+        with HashCache(cache_dir) as cache:
+            cache.put_entry(first)
+            cache.put_entry(second)
+            assert cache.get_entry(first.file_path, HashAlgorithm.XXH128) == second
+
+        # THEN
+        with HashCache(cache_dir) as cache:
+            assert _committed_rows(cache) == 1
+            assert cache.get_entry(first.file_path, HashAlgorithm.XXH128) == second
+
+    def test_concurrent_puts_are_all_committed(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+        errors = []
+        with patch.object(CacheDB, "_WRITE_BATCH_SIZE", 50):
+            with HashCache(cache_dir) as cache:
+
+                def writer(start):
+                    try:
+                        for i in range(start, start + 500):
+                            cache.put_entry(_hash_entry(i))
+                    except Exception as e:  # pragma: no cover - surfaced by the assert below
+                        errors.append(e)
+
+                # WHEN
+                threads = [threading.Thread(target=writer, args=(t * 500,)) for t in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+        # THEN
+        assert errors == []
+        with HashCache(cache_dir) as cache:
+            assert _committed_rows(cache) == 4000
+
+    def test_remove_cache_discards_pending_entries(self, tmpdir):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+
+        # WHEN: exiting after remove_cache must not try to write to the closed connection
+        with S3CheckCache(cache_dir) as cache:
+            cache.put_entry(S3CheckCacheEntry(s3_key="k", last_seen_time="1"))
+            cache.remove_cache()
+
+        # THEN
+        assert not os.path.exists(cache.cache_dir)
+
+    def test_failed_flush_on_exit_logs_and_does_not_raise(self, tmpdir, caplog):
+        # GIVEN
+        cache_dir = tmpdir.mkdir("cache")
+
+        # WHEN
+        with patch.object(
+            HashCache, "_insert_sql", return_value="INSERT INTO missing_table VALUES(:file_path)"
+        ):
+            with HashCache(cache_dir) as cache:
+                cache.put_entry(_hash_entry(1))
+
+        # THEN
+        assert "Failed to write hash_cache entries" in caplog.text
